@@ -354,6 +354,9 @@ def responses_create() -> Response:
         except Exception:
             err_body = {"raw": upstream.text}
         error_msg = (err_body.get("error", {}) or {}).get("message", "Upstream error")
+        # Log error in debug mode
+        if debug or verbose:
+            print(f"[responses] ERROR {upstream.status_code}: {err_body}")
         return jsonify({"error": {"message": error_msg}}), upstream.status_code
 
     if stream_req:
