@@ -189,6 +189,7 @@ def responses_create() -> Response:
     store and previous_response_id.
     """
     request_start = time.time()
+    verbose = bool(current_app.config.get("VERBOSE"))
     reasoning_effort = current_app.config.get("REASONING_EFFORT", "medium")
     reasoning_summary = current_app.config.get("REASONING_SUMMARY", "auto")
     debug_model = current_app.config.get("DEBUG_MODEL")
@@ -334,7 +335,8 @@ def responses_create() -> Response:
     reasoning_param = build_reasoning_param(reasoning_effort, reasoning_summary, reasoning_overrides)
 
     # Passthrough fields (NOT store or previous_response_id - those are local only)
-    passthrough_keys = ["temperature", "top_p", "seed", "stop", "text", "metadata", "include", "top_logprobs", "truncation"]
+    # Note: Some parameters may work with ChatGPT backend even if not in official OpenAI docs
+    passthrough_keys = ["temperature", "top_p", "seed", "stop", "metadata", "max_output_tokens", "truncation"]
     extra_fields: Dict[str, Any] = {}
     for k in passthrough_keys:
         if k in payload and payload.get(k) is not None:

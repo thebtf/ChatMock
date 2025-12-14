@@ -126,7 +126,8 @@ def start_upstream_request(
         "parallel_tool_calls", "store", "stream", "include", "prompt_cache_key",
         "reasoning",
     }
-    _allowed = {"temperature", "top_p", "seed", "max_output_tokens", "metadata", "stop", "text", "top_logprobs", "truncation"}
+    # Note: Some parameters may work with ChatGPT backend even if not in official OpenAI docs
+    _allowed = {"temperature", "top_p", "seed", "max_output_tokens", "metadata", "stop", "truncation"}
     if isinstance(extra_fields, dict):
         for k, v in extra_fields.items():
             if v is None:
