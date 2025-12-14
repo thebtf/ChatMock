@@ -25,7 +25,7 @@ from requests.exceptions import ChunkedEncodingError, ConnectionError, ReadTimeo
 
 try:
     from urllib3.exceptions import ProtocolError
-except Exception:
+except ImportError:
     ProtocolError = Exception  # type: ignore
 
 from .config import BASE_INSTRUCTIONS, GPT5_CODEX_INSTRUCTIONS
@@ -47,11 +47,12 @@ _STORE_LOCK = threading.Lock()
 _STORE: OrderedDict[str, Dict[str, Any]] = OrderedDict()
 _MAX_STORE_ITEMS = 200
 
-# Simple in-memory threads map: response_id -> list of input items
+# Simple in-memory threads map: response_id -> list of input items (FIFO, size-limited)
 # representing the conversation so far for previous_response_id simulation
 _THREADS_LOCK = threading.Lock()
-_THREADS: Dict[str, List[Dict[str, Any]]] = {}
+_THREADS: "OrderedDict[str, List[Dict[str, Any]]]" = OrderedDict()
 _MAX_THREAD_ITEMS = 40
+_MAX_THREAD_RESPONSES = 200
 
 
 def _store_response(obj: Dict[str, Any]) -> None:
@@ -77,13 +78,17 @@ def _get_response(rid: str) -> Optional[Dict[str, Any]]:
 
 
 def _set_thread(rid: str, items: List[Dict[str, Any]]) -> None:
-    """Store conversation thread for previous_response_id simulation."""
+    """Store conversation thread for previous_response_id simulation (FIFO, bounded)."""
     try:
         if not (isinstance(rid, str) and rid and isinstance(items, list)):
             return
         trimmed = items[-_MAX_THREAD_ITEMS:]
         with _THREADS_LOCK:
+            if rid in _THREADS:
+                _THREADS.pop(rid, None)
             _THREADS[rid] = trimmed
+            while len(_THREADS) > _MAX_THREAD_RESPONSES:
+                _THREADS.popitem(last=False)
     except Exception:
         pass
 
@@ -116,37 +121,39 @@ def _collect_rs_ids(obj: Any, parent_key: Optional[str] = None, out: Optional[Li
 
 
 def _sanitize_input_remove_refs(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Remove upstream rs_* references from input items."""
-    def drop_ref_fields(d: Dict[str, Any]) -> Dict[str, Any]:
-        for key in ("previous_response_id", "response_id", "reference_id", "item_id"):
-            if isinstance(d.get(key), str) and d.get(key, "").startswith("rs_"):
-                d.pop(key, None)
-        return d
+    """Remove upstream rs_* references from input items (recursive)."""
+    REF_KEYS = {"previous_response_id", "response_id", "reference_id", "item_id"}
 
-    out: List[Dict[str, Any]] = []
+    def sanitize_obj(obj: Any) -> Any:
+        if isinstance(obj, dict):
+            out: Dict[str, Any] = {}
+            for k, v in obj.items():
+                if (
+                    isinstance(k, str)
+                    and k in REF_KEYS
+                    and isinstance(v, str)
+                    and v.strip().startswith("rs_")
+                ):
+                    continue
+                out[k] = sanitize_obj(v)
+            return out
+        if isinstance(obj, list):
+            return [sanitize_obj(v) for v in obj]
+        return obj
+
+    result: List[Dict[str, Any]] = []
     for it in items or []:
         if not isinstance(it, dict):
             continue
-        it2 = drop_ref_fields(dict(it))
-        content = it2.get("content")
-        if isinstance(content, list):
-            new_parts = []
-            for p in content:
-                if not isinstance(p, dict):
-                    new_parts.append(p)
-                    continue
-                if _collect_rs_ids(p):
-                    p = {k: v for k, v in p.items()
-                         if k not in ("previous_response_id", "response_id", "reference_id", "item_id")}
-                new_parts.append(p)
-            it2["content"] = new_parts
-        out.append(it2)
-    return out
+        result.append(sanitize_obj(it))
+    return result
 
 
 def _instructions_for_model(model: str) -> str:
     """Get base instructions for a model."""
     base = current_app.config.get("BASE_INSTRUCTIONS", BASE_INSTRUCTIONS)
+    if not isinstance(base, str) or not base.strip():
+        base = "You are a helpful assistant."
     if model == "gpt-5-codex":
         codex = current_app.config.get("GPT5_CODEX_INSTRUCTIONS") or GPT5_CODEX_INSTRUCTIONS
         if isinstance(codex, str) and codex.strip():
@@ -182,7 +189,6 @@ def responses_create() -> Response:
     store and previous_response_id.
     """
     request_start = time.time()
-    verbose = bool(current_app.config.get("VERBOSE"))
     reasoning_effort = current_app.config.get("REASONING_EFFORT", "medium")
     reasoning_summary = current_app.config.get("REASONING_SUMMARY", "auto")
     debug_model = current_app.config.get("DEBUG_MODEL")
@@ -195,10 +201,15 @@ def responses_create() -> Response:
         return jsonify({"error": {"message": "Invalid JSON body"}}), 400
 
     # Determine streaming mode (default: true)
-    stream_req = payload.get("stream")
-    if stream_req is None:
+    stream_req_raw = payload.get("stream")
+    if stream_req_raw is None:
         stream_req = True
-    stream_req = bool(stream_req)
+    elif isinstance(stream_req_raw, bool):
+        stream_req = stream_req_raw
+    elif isinstance(stream_req_raw, str):
+        stream_req = stream_req_raw.strip().lower() not in ("0", "false", "no", "off")
+    else:
+        stream_req = bool(stream_req_raw)
 
     # Get and normalize model
     requested_model = payload.get("model")
@@ -362,14 +373,17 @@ def responses_create() -> Response:
     if stream_req:
         # Streaming mode - passthrough SSE events
         def _passthrough():
+            stream_ok = True
             try:
                 for chunk in upstream.iter_content(chunk_size=8192):
                     if not chunk:
                         continue
                     yield chunk
             except (ChunkedEncodingError, ProtocolError, ConnectionError, ReadTimeout):
+                stream_ok = False
                 return
             except Exception:
+                stream_ok = False
                 return
             finally:
                 try:
@@ -382,7 +396,7 @@ def responses_create() -> Response:
                         record_request(
                             model=model,
                             endpoint="/v1/responses",
-                            success=True,
+                            success=stream_ok,
                             response_time=time.time() - request_start,
                             total_tokens=0,
                             prompt_tokens=0,
@@ -407,7 +421,6 @@ def responses_create() -> Response:
     usage_obj: Optional[Dict[str, int]] = None
     full_text = ""
     output_items: List[Dict[str, Any]] = []
-    upstream_response_id: Optional[str] = None
 
     try:
         for raw_line in upstream.iter_lines(decode_unicode=False):
@@ -427,10 +440,6 @@ def responses_create() -> Response:
                 continue
 
             kind = evt.get("type")
-
-            # Capture response ID from upstream
-            if isinstance(evt.get("response"), dict) and isinstance(evt["response"].get("id"), str):
-                upstream_response_id = evt["response"].get("id")
 
             if kind == "response.output_text.delta":
                 delta = evt.get("delta") or ""
@@ -475,15 +484,16 @@ def responses_create() -> Response:
     if usage_obj:
         response_obj["usage"] = usage_obj
 
-    # Store if requested
+    # Store response if requested (for retrieval via GET)
     if store_locally:
         _store_response(response_obj)
-        # Also store thread for previous_response_id simulation
-        thread_items = list(input_items)
-        for item in output_items:
-            if isinstance(item, dict):
-                thread_items.append(item)
-        _set_thread(response_id, thread_items)
+
+    # Always store thread for previous_response_id simulation (bounded FIFO)
+    thread_items = list(input_items)
+    for item in output_items:
+        if isinstance(item, dict):
+            thread_items.append(item)
+    _set_thread(response_id, thread_items)
 
     # Record request in statistics
     if record_request is not None:
@@ -531,7 +541,7 @@ def responses_retrieve(response_id: str) -> Response:
 
 @responses_bp.route("/v1/responses", methods=["OPTIONS"])
 @responses_bp.route("/v1/responses/<response_id>", methods=["OPTIONS"])
-def responses_options(**kwargs) -> Response:
+def responses_options(**_kwargs) -> Response:
     """Handle CORS preflight requests."""
     resp = make_response("", 204)
     for k, v in build_cors_headers().items():

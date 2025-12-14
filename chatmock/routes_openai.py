@@ -169,7 +169,7 @@ def chat_completions() -> Response:
     input_items = convert_chat_messages_to_responses_input(messages)
     if not input_items and isinstance(payload.get("prompt"), str) and payload.get("prompt").strip():
         input_items = [
-            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": payload.get("prompt")}]}
+            {"role": "user", "content": [{"type": "input_text", "text": payload.get("prompt")}]}
         ]
 
     model_reasoning = extract_reasoning_from_model_name(requested_model)

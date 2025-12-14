@@ -120,10 +120,22 @@ def start_upstream_request(
         responses_payload["reasoning"] = reasoning_param
 
     # Merge extra fields (e.g., temperature, top_p, seed, etc.)
+    # Protect reserved keys that define protocol/contract with downstream SSE consumers.
+    _reserved = {
+        "model", "instructions", "input", "tools", "tool_choice",
+        "parallel_tool_calls", "store", "stream", "include", "prompt_cache_key",
+        "reasoning",
+    }
+    _allowed = {"temperature", "top_p", "seed", "max_output_tokens", "metadata", "stop", "text", "top_logprobs", "truncation"}
     if isinstance(extra_fields, dict):
         for k, v in extra_fields.items():
-            if v is not None:
-                responses_payload[k] = v
+            if v is None:
+                continue
+            if k in _reserved:
+                continue
+            if k not in _allowed:
+                continue
+            responses_payload[k] = v
 
     verbose = False
     debug = False
